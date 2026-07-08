@@ -1,0 +1,19 @@
+# 运行时产物（数据日志，不入库）
+*.csv
+*.json
+*.log
+*.err
+*.bak
+run.log
+nohup.out
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 系统
+.DS_Store
+
+# 说明：SLACK_WEBHOOK_URL / PROXY_URL 通过环境变量提供，不写进代码库
