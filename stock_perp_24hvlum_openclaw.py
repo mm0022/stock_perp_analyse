@@ -732,8 +732,8 @@ def build_cross_arb_rows(tokens, hist, contract_prices, oi_usd, fr_map, now_ms):
     rows.sort(key=lambda r: -(r['net_7d'] or 0))
     return rows
 
-def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, now_ms):
-    """Binance 有现货(XXXBUSDT)的股票永续：3d/7d/30d funding 年化 + 期现基差 + 现货/合约24h成交量；按 7dF 降序"""
+def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_ms):
+    """Binance 有现货(XXXBUSDT)的股票永续：当期funding + 3d/7d/30d funding 年化 + 期现基差 + 现货/合约24h成交量；按 7dF 降序"""
     spot = fetch_json("https://api.binance.com/api/v3/ticker/24hr")
     spot_map = {}  # base -> (现货价, 现货24h成交额USDT)；现货 symbol = base + 'B' + 'USDT'
     if isinstance(spot, list):
@@ -763,9 +763,12 @@ def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, now_ms):
         spot_p, spot_vol = spot_map[tok]
         pv = vol_bn.get(tok)
         perp_vol = pv if isinstance(pv, (int, float)) else None
+        cb = fr_map.get('Binance', {}).get(tok, {}).get('bp', '-')
+        funding_bp = cb if isinstance(cb, (int, float)) else None
         spread = (perp - spot_p) / perp * 10000 if perp and perp > 0 else None
         rows.append({
             'symbol': tok,
+            'funding_bp': funding_bp,
             '3dF': round(f3, 2) if f3 is not None else None,
             '7dF': round(f7, 2) if f7 is not None else None,
             '30dF': round(f30, 2) if f30 is not None else None,
@@ -985,15 +988,16 @@ def main():
               f"{r['fee_bp']:>11.1f}{be:>11}{fmt_oi(r['min_oi']):>18}{tag:>20}")
 
     # ============ 表6: Binance 股票永续 Funding + 期现基差 ============
-    binance_basis = build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, now_ms)
+    binance_basis = build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_ms)
     print(f"\nBinance 股票永续期现基差 (仅有现货的 {len(binance_basis)} 个) — {date_str}  (按7dF降序)")
-    print(f"{'symbol':<18}{'3dF':>13}{'7dF':>13}{'30dF':>13}{'perp':>12}{'spot':>12}{'spread_bp':>13}{'合约24hVol':>16}{'现货24hVol':>16}")
-    print("-" * 124)
+    print(f"{'symbol':<18}{'fund(bp)':>10}{'3dF':>13}{'7dF':>13}{'30dF':>13}{'perp':>12}{'spot':>12}{'spread_bp':>13}{'合约24hVol':>16}{'现货24hVol':>16}")
+    print("-" * 134)
     for r in binance_basis[:30]:
         sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
         pp = '-' if r['perp'] is None else f"{r['perp']:g}"
         st = f"{r['spot']:g}"
-        print(f"{r['symbol']+'/USDT':<18}{fmt_pct(r['3dF']):>13}{fmt_pct(r['7dF']):>13}"
+        fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
+        print(f"{r['symbol']+'/USDT':<18}{fb:>10}{fmt_pct(r['3dF']):>13}{fmt_pct(r['7dF']):>13}"
               f"{fmt_pct(r['30dF']):>13}{pp:>12}{st:>12}{sp:>13}"
               f"{fmt_oi(r['perp_vol']):>16}{fmt_oi(r['spot_vol']):>16}")
 
@@ -1101,14 +1105,15 @@ def build_binance_basis_blocks(basis_rows, current_time):
         return []
     date_str = current_time[:10]
     top = basis_rows[:30]
-    header = f"{'symbol':<13}{'3dF':>9}{'7dF':>9}{'30dF':>9}{'spread':>9}{'perpVol':>10}{'spotVol':>10}"
+    header = f"{'symbol':<13}{'fund':>7}{'3dF':>9}{'7dF':>9}{'30dF':>9}{'spread':>9}{'perpVol':>10}{'spotVol':>10}"
 
     def fr(r):
         sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
-        return (f"{r['symbol']+'/USDT':<13}{fmt_pct(r['3dF']):>9}{fmt_pct(r['7dF']):>9}"
+        fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
+        return (f"{r['symbol']+'/USDT':<13}{fb:>7}{fmt_pct(r['3dF']):>9}{fmt_pct(r['7dF']):>9}"
                 f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_oi(r['perp_vol']):>10}{fmt_oi(r['spot_vol']):>10}")
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"📊 Binance股票永续期现基差 (有现货{len(top)}个) — {date_str}"}}]
-    legend = ("*字段*：仅列有现货(XXXB)的股票；`3dF/7dF/30dF`=近3/7/30天 funding 年化%（按 7dF 降序）\n"
+    legend = ("*字段*：仅列有现货(XXXB)的股票；`fund`=当期 funding(bp) | `3dF/7dF/30dF`=近3/7/30天 funding 年化%（按 7dF 降序）\n"
               "• `spread`=(perp−spot)/perp×1e4 bp，永续相对现货的溢价（+溢价/−折价），可做期现对冲\n"
               "• `perpVol/spotVol`=合约/现货 24h 成交额(USDT)")
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": legend}})
