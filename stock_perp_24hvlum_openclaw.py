@@ -57,6 +57,12 @@ def fmt_oi(v):
         return f"{v/1e3:.2f}K"
     return f"{v:.0f}"
 
+def fmt_mio(v):
+    """成交量/金额统一按百万(mio)显示，便于横向比较"""
+    if not isinstance(v, (int, float)):
+        return '-'
+    return f"{v/1e6:.1f}M"
+
 def fmt_pct(v):
     """年化/波动 带 % 号（1位小数）"""
     return f"{v:.1f}%" if isinstance(v, (int, float)) else '-'
@@ -621,7 +627,7 @@ def build_funding_profile_rows(tokens, hist, fr_map, oi_usd, spot_avail, current
         rows.extend(ex_rows[:30])
     return rows
 
-def cross_pair_metrics(tok, ex_a, ex_b, series_a, series_b, price_a, price_b, oi_a, oi_b, curr_a, curr_b, now_ms):
+def cross_pair_metrics(tok, ex_a, ex_b, series_a, series_b, price_a, price_b, oi_a, oi_b, curr_a, curr_b, vol_a, vol_b, now_ms):
     """跨所净 funding 套利指标（高7d年化所做空、低所做多）；7d为主、30d看持续。数据不足返回 None"""
     day = 86400000
     if not series_a or not series_b:
@@ -638,11 +644,11 @@ def cross_pair_metrics(tok, ex_a, ex_b, series_a, series_b, price_a, price_b, oi
     b3 = window_apr(series_b, now_ms - 3 * day, ib)
     # 高 7d 年化所做空(收 funding)，低所做多(付 funding)
     if a7 >= b7:
-        short_ex, short_s, short_p, s7, s30, s3, short_oi, curr_short = ex_a, series_a, price_a, a7, a30, a3, oi_a, curr_a
-        long_ex, long_s, long_p, l7, l30, l3, long_oi, curr_long = ex_b, series_b, price_b, b7, b30, b3, oi_b, curr_b
+        short_ex, short_s, short_p, s7, s30, s3, short_oi, curr_short, short_vol = ex_a, series_a, price_a, a7, a30, a3, oi_a, curr_a, vol_a
+        long_ex, long_s, long_p, l7, l30, l3, long_oi, curr_long, long_vol = ex_b, series_b, price_b, b7, b30, b3, oi_b, curr_b, vol_b
     else:
-        short_ex, short_s, short_p, s7, s30, s3, short_oi, curr_short = ex_b, series_b, price_b, b7, b30, b3, oi_b, curr_b
-        long_ex, long_s, long_p, l7, l30, l3, long_oi, curr_long = ex_a, series_a, price_a, a7, a30, a3, oi_a, curr_a
+        short_ex, short_s, short_p, s7, s30, s3, short_oi, curr_short, short_vol = ex_b, series_b, price_b, b7, b30, b3, oi_b, curr_b, vol_b
+        long_ex, long_s, long_p, l7, l30, l3, long_oi, curr_long, long_vol = ex_a, series_a, price_a, a7, a30, a3, oi_a, curr_a, vol_a
     f7 = s7 - l7                                                    # 7d funding 净年化
     f3 = (s3 - l3) if (s3 is not None and l3 is not None) else None  # 3d funding 净年化
     net30 = (s30 - l30) if (s30 is not None and l30 is not None) else None
@@ -700,11 +706,13 @@ def cross_pair_metrics(tok, ex_a, ex_b, series_a, series_b, price_a, price_b, oi
         'fee_bp': round(fee_bp, 2), 'spread_bp': round(spread_bp, 2),
         'breakeven_d': round(breakeven, 1) if breakeven != float('inf') else None,
         'min_oi': round(min_oi, 0) if min_oi is not None else None,
+        'long_vol': round(long_vol, 0) if isinstance(long_vol, (int, float)) else None,
+        'short_vol': round(short_vol, 0) if isinstance(short_vol, (int, float)) else None,
         'verdict': verdict, 'reason': reason,
     }
 
-def build_cross_arb_rows(tokens, hist, contract_prices, oi_usd, fr_map, now_ms):
-    """每标的在三所里两两配对，取 7d 净差最高的一对；按 net_7d 降序。fr_map 提供当期 funding 用于「可进」判断"""
+def build_cross_arb_rows(tokens, hist, contract_prices, oi_usd, fr_map, vol_map, now_ms):
+    """每标的在三所里两两配对，取 7d 净差最高的一对；按 net_7d 降序。fr_map 当期 funding；vol_map 各所 24h 成交量"""
     exs = ('Binance', 'OKX', 'Bybit')
     rows = []
     for tok in tokens:
@@ -724,7 +732,11 @@ def build_cross_arb_rows(tokens, hist, contract_prices, oi_usd, fr_map, now_ms):
                 cb = fr_map.get(eb, {}).get(tok, {}).get('bp', '-')
                 ca = ca if isinstance(ca, (int, float)) else None
                 cb = cb if isinstance(cb, (int, float)) else None
-                r = cross_pair_metrics(tok, ea, eb, sa, sb, pa, pb, oa, ob, ca, cb, now_ms)
+                va = vol_map.get(ea, {}).get(tok)
+                vb = vol_map.get(eb, {}).get(tok)
+                va = va if isinstance(va, (int, float)) else None
+                vb = vb if isinstance(vb, (int, float)) else None
+                r = cross_pair_metrics(tok, ea, eb, sa, sb, pa, pb, oa, ob, ca, cb, va, vb, now_ms)
                 if r and (best is None or r['net_7d'] > best['net_7d']):
                     best = r
         if best:
@@ -863,7 +875,6 @@ def main():
     vol_gt = get_gate_data(tokens)
     
     # 获取现货价格
-    spot_prices = get_spot_prices(tokens)
     
     # 获取 Funding Rate
     fr_bn = get_binance_funding(tokens)
@@ -905,41 +916,6 @@ def main():
         rows_vol.append(row)
         print(f"{tok:<8} {format_num(v1) if v1 != '-' else '-':>12} {format_num(v2) if v2 != '-' else '-':>12} {format_num(v3) if v3 != '-' else '-':>12} {format_num(v4) if v4 != '-' else '-':>12} {format_num(v5) if v5 != '-' else '-':>12} {format_num(v6) if v6 != '-' else '-':>12}")
     
-    print("\n" + "="*80)
-    print("📊 表2: 期现套利分析 (同一交易所)")
-    print("="*80)
-    header = f"{'Symbol':<8} {'现货价':>12} {'合约价':>12} {'基差%':>10} {'FR年化':>10}"
-    print(header)
-    print("-"*80)
-    
-    rows_arb = []
-    for tok in tokens:
-        if tok not in spot_prices:
-            continue
-        spot_data = spot_prices.get(tok, {})
-        spot_price = spot_data.get('binance') or spot_data.get('okx', 0)
-        if not spot_price or spot_price <= 0:
-            continue
-        
-        # 尝试获取合约价格
-        # 简化：从成交量或 Funding Rate 估算
-        # 这里暂时跳过，需要从合约ticker获��last价格
-        # 暂时只显示有 FR 的
-        fr = fr_bn.get(tok, {}).get('bp', '-')
-        if fr != '-':
-            # 基差% = FR年化 / 2 (简化)
-            basis = fr_bn[tok].get('annualized', 0)
-            if isinstance(basis, (int, float)):
-                row = {
-                    'Symbol': tok,
-                    'Spot': f"{spot_price:.4f}" if spot_price < 100 else f"{spot_price:.2f}",
-                    'Fut': '-',
-                    'Basis%': f"{basis/2:.2f}%" if basis else '-',
-                    'FR_Ann': f"{basis:.2f}%" if basis else '-'
-                }
-                rows_arb.append(row)
-                print(f"{tok:<8} {spot_price:>12.4f} {'-':>12} {f'{basis/2:.2f}%' if basis else '-':>10} {f'{basis:.2f}%' if basis else '-':>10}")
-    
     # ============ 表4: 单所 Funding 画像 ============
     now_ms = time.time() * 1000
     hist_prev = load_funding_history()
@@ -971,12 +947,14 @@ def main():
                   f"{fmt_pct(r['30d_apr%']):>10}{fmt_pct(r['std_7d_y%']):>11}{fmt_oi(r['OI_usd']):>12}{r['spot']:>5}")
 
     # ============ 表5: 跨所净 Funding 套利 (持仓视角) ============
-    cross_arb = build_cross_arb_rows(tokens, hist, contract_prices, oi_usd, fr_map, now_ms)
+    vol_map = {'Binance': vol_bn, 'OKX': vol_ok, 'Bybit': vol_bb}
+    cross_arb = build_cross_arb_rows(tokens, hist, contract_prices, oi_usd, fr_map, vol_map, now_ms)
     print(f"\n跨所净 Funding 套利 Top{min(30, len(cross_arb))} — {date_str}  (高FR所做空/低FR所做多)")
     print(f"{'symbol':<24}{'做多所':<18}{'做空所':<18}"
           f"{'3d_fund':>16}{'3d_sprd':>16}{'net_3d':>16}{'7d_fund':>16}{'7d_sprd':>16}{'net_7d':>16}"
-          f"{'net_30d':>16}{'一致率':>14}{'当前净bp':>13}{'可进':>8}{'费bp':>11}{'回本d':>11}{'minOI':>18}{'判定':>20}")
-    print("-" * 280)
+          f"{'net_30d':>16}{'一致率':>14}{'当前净bp':>13}{'可进':>8}{'费bp':>11}{'回本d':>11}{'minOI':>16}"
+          f"{'多所24hVol':>16}{'空所24hVol':>16}{'判定':>20}")
+    print("-" * 320)
     for r in cross_arb[:30]:
         be = '-' if r['breakeven_d'] is None else f"{r['breakeven_d']:g}"
         tag = r['verdict'] + (f"({r['reason']})" if r['reason'] else '')
@@ -985,7 +963,8 @@ def main():
               f"{fmt_pct(r['3d_funding']):>16}{fmt_pct(r['3d_spread']):>16}{fmt_pct(r['net_3d']):>16}"
               f"{fmt_pct(r['7d_funding']):>16}{fmt_pct(r['7d_spread']):>16}{fmt_pct(r['net_7d']):>16}"
               f"{fmt_pct(r['net_30d']):>16}{r['consistency']*100:>13.0f}%{cn:>13}{r['enter']:>8}"
-              f"{r['fee_bp']:>11.1f}{be:>11}{fmt_oi(r['min_oi']):>18}{tag:>20}")
+              f"{r['fee_bp']:>11.1f}{be:>11}{fmt_oi(r['min_oi']):>16}"
+              f"{fmt_mio(r['long_vol']):>16}{fmt_mio(r['short_vol']):>16}{tag:>20}")
 
     # ============ 表6: Binance 股票永续 Funding + 期现基差 ============
     binance_basis = build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_ms)
@@ -999,7 +978,7 @@ def main():
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
         print(f"{r['symbol']+'/USDT':<18}{fb:>10}{fmt_pct(r['3dF']):>13}{fmt_pct(r['7dF']):>13}"
               f"{fmt_pct(r['30dF']):>13}{pp:>12}{st:>12}{sp:>13}"
-              f"{fmt_oi(r['perp_vol']):>16}{fmt_oi(r['spot_vol']):>16}")
+              f"{fmt_mio(r['perp_vol']):>16}{fmt_mio(r['spot_vol']):>16}")
 
     # 保存 CSV
     df = pd.DataFrame(rows_vol)
@@ -1025,19 +1004,16 @@ def main():
         append_csv(dbb, "binance_basis_log.csv")
         print(f"💾 表6已保存至：binance_basis_log.csv")
 
-    # 发送 Slack：表4+表5+表6 合并成一条消息，避免 Slack webhook 逐条排队
+    # 发送 Slack：只发表5跨所套利 + 表6期现基差（表4画像/表1成交量 只算不发）
     if SLACK_WEBHOOK_URL:
-        combined = (build_profile_blocks(rows_profile, current_time)
-                    + build_cross_blocks(cross_arb, current_time)
+        combined = (build_cross_blocks(cross_arb, current_time)
                     + build_binance_basis_blocks(binance_basis, current_time))
         if combined:
             try:
                 resp = requests.post(SLACK_WEBHOOK_URL, json={"blocks": combined}, timeout=10)
-                print("✅ 已发送 Funding画像+套利 到 Slack" if resp.status_code == 200 else f"❌ Slack 失败: {resp.status_code}")
+                print("✅ 已发送 跨所套利+期现基差 到 Slack" if resp.status_code == 200 else f"❌ Slack 失败: {resp.status_code}")
             except Exception as e:
                 print(f"❌ Slack 错误: {e}")
-        # 表1成交量 单独发
-        send_slack_volume_report(rows_vol, current_time)
 
 def build_profile_blocks(rows_profile, current_time):
     """构建表4 单所 Funding 画像的 Slack blocks 列表（供与其他表合并成一条消息）"""
@@ -1076,7 +1052,7 @@ def build_cross_blocks(cross_arb, current_time):
     rows = cross_arb[:30]
     # 全 ASCII 表头/取值，避免中文与 emoji 在等宽字体下宽度≠len 导致错位
     header = (f"{'symbol':<13}{'long':<11}{'short':<11}{'3dF':>10}{'3dS':>10}{'n3d':>10}"
-              f"{'7dF':>10}{'7dS':>10}{'n7d':>10}{'cons':>8}{'ent':>6}{'v':>5}")
+              f"{'7dF':>10}{'7dS':>10}{'n7d':>10}{'cons':>8}{'longV':>9}{'shortV':>9}{'ent':>6}{'v':>5}")
 
     def fmtrow(r):
         # 红绿灯 emoji：同款 emoji 宽度一致(都2格)，放最后两列既醒目又不破坏对齐
@@ -1085,12 +1061,12 @@ def build_cross_blocks(cross_arb, current_time):
         return (f"{r['symbol']+'/USDT':<13}{EX_DISPLAY[r['long_ex']]:<11}{EX_DISPLAY[r['short_ex']]:<11}"
                 f"{fmt_pct(r['3d_funding']):>10}{fmt_pct(r['3d_spread']):>10}{fmt_pct(r['net_3d']):>10}"
                 f"{fmt_pct(r['7d_funding']):>10}{fmt_pct(r['7d_spread']):>10}{fmt_pct(r['net_7d']):>10}"
-                f"{r['consistency']*100:>7.0f}%{ent:>5}{v:>4}")
+                f"{r['consistency']*100:>7.0f}%{fmt_mio(r['long_vol']):>9}{fmt_mio(r['short_vol']):>9}{ent:>5}{v:>4}")
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"📊 跨所净Funding套利 Top{len(rows)} — {date_str}"}}]
     legend = ("*字段*：long=低FR所做多 / short=高FR所做空（delta中性吃 funding 差）\n"
               "• `3dF/7dF`=近3/7天 funding 净年化% | `3dS/7dS`=当前价差按3/7天平仓年化%\n"
               "• `n3d/n7d`=funding+spread 合计年化% | `cons`=近7天净差为正占比(越高越稳)\n"
-              "• `ent`=当期可进(🟢空−多>0此刻有利/🔴否/⚪未知) | `v`=判定(🟢推荐/⚪观察)")
+              "• `longV/shortV`=做多/做空所 24h 成交额(百万U) | `ent`=当期可进(🟢有利/🔴否/⚪未知) | `v`=判定(🟢推荐/⚪观察)")
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": legend}})
     # 列加宽 + emoji 后单块超 3000 字符，每 15 行一个 code block
     for i in range(0, len(rows), 15):
@@ -1111,7 +1087,7 @@ def build_binance_basis_blocks(basis_rows, current_time):
         sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
         return (f"{r['symbol']+'/USDT':<13}{fb:>7}{fmt_pct(r['3dF']):>9}{fmt_pct(r['7dF']):>9}"
-                f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_oi(r['perp_vol']):>10}{fmt_oi(r['spot_vol']):>10}")
+                f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_mio(r['perp_vol']):>10}{fmt_mio(r['spot_vol']):>10}")
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"📊 Binance股票永续期现基差 (有现货{len(top)}个) — {date_str}"}}]
     legend = ("*字段*：仅列有现货(XXXB)的股票；`fund`=当期 funding(bp) | `3dF/7dF/30dF`=近3/7/30天 funding 年化%（按 7dF 降序）\n"
               "• `spread`=(perp−spot)/perp×1e4 bp，永续相对现货的溢价（+溢价/−折价），可做期现对冲\n"

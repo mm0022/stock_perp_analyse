@@ -84,9 +84,10 @@ def test_cross_pair_metrics_basic():
         return {now - i * hi: rate for i in range(n)}
     sa = series(0.0002)  # Binance 高
     sb = series(0.0001)  # OKX 低
-    r = m.cross_pair_metrics('X', 'Binance', 'OKX', sa, sb, 100.0, 100.0, 1e6, 1e6, 2.0, 1.0, now)
+    r = m.cross_pair_metrics('X', 'Binance', 'OKX', sa, sb, 100.0, 100.0, 1e6, 1e6, 2.0, 1.0, 5e6, 3e6, now)
     assert r['short_ex'] == 'Binance' and r['long_ex'] == 'OKX'  # 高7d做空
     assert r['enter'] == '✅'   # 当期 空(2.0) − 多(1.0) = 1.0 > 0
+    assert r['short_vol'] == 5e6 and r['long_vol'] == 3e6   # vol 按 short/long 归位
     assert abs(r['7d_funding'] - 21.9) < 0.5   # 43.8 - 21.9
     assert abs(r['3d_funding'] - 21.9) < 0.5   # 恒定 rate → 3d funding 同 7d
     assert r['3d_spread'] == 0.0 and r['7d_spread'] == 0.0   # 价格相同 → 价差 0
@@ -102,7 +103,7 @@ def test_cross_pair_metrics_unstable():
         ts = now - i * hi
         sa[ts] = 0.0003 if i % 2 == 0 else -0.0002  # 交替，均值低
         sb[ts] = 0.0001
-    r = m.cross_pair_metrics('X', 'Binance', 'OKX', sa, sb, 100.0, 100.0, 1e6, 1e6, None, None, now)
+    r = m.cross_pair_metrics('X', 'Binance', 'OKX', sa, sb, 100.0, 100.0, 1e6, 1e6, None, None, 5e6, 3e6, now)
     assert r['consistency'] < 0.8
     assert r['reason'] == 'funding不稳' and r['verdict'] == '⏸'
     assert r['enter'] == '?'   # 当期 funding 缺失 → 无法判断
