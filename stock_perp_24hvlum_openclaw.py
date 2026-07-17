@@ -67,6 +67,28 @@ def fmt_pct(v):
     """年化/波动 带 % 号（1位小数）"""
     return f"{v:.1f}%" if isinstance(v, (int, float)) else '-'
 
+def get_binance_collateral_rate():
+    """Binance 组合保证金折算率(公开 bapi，无需 API key)。返回 {asset: collateralRate}。
+    股票代币的 asset 为现货代币名(如 TSLAB)，当前折算率 0.5"""
+    try:
+        resp = requests.get(
+            "https://www.binance.com/bapi/margin/v1/public/margin/portfolio/collateral-rate",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10, proxies=proxies)
+        if resp.status_code != 200:
+            print(f"⚠️ Binance 折算率获取失败: {resp.status_code}")
+            return {}
+        data = resp.json().get('data') or []
+        out = {}
+        for x in data:
+            try:
+                out[x['asset']] = float(x['collateralRate'])
+            except (KeyError, ValueError, TypeError):
+                pass
+        return out
+    except Exception as e:
+        print(f"⚠️ Binance 折算率错误: {e}")
+        return {}
+
 def append_csv(df, path):
     """追加 df 到 CSV；若已有文件的列结构与 df 不同（schema 变更），先把旧文件备份为 .bak 再按新结构重写"""
     if os.path.isfile(path):
@@ -759,6 +781,7 @@ def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_
                         spot_map[base] = (float(it['lastPrice']), float(it['quoteVolume']))
                     except (KeyError, ValueError, TypeError):
                         pass
+    collat = get_binance_collateral_rate()  # {asset: 折算率}；未配 API key 则为空
     day = 86400000
     rows = []
     for tok in tokens:
@@ -778,9 +801,11 @@ def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_
         cb = fr_map.get('Binance', {}).get(tok, {}).get('bp', '-')
         funding_bp = cb if isinstance(cb, (int, float)) else None
         spread = (perp - spot_p) / perp * 10000 if perp and perp > 0 else None
+        disc = collat.get(tok + 'B', collat.get(tok))  # 现货代币名 XXXB 优先，回退 base
         rows.append({
             'symbol': tok,
             'funding_bp': funding_bp,
+            'discount': disc,
             '3dF': round(f3, 2) if f3 is not None else None,
             '7dF': round(f7, 2) if f7 is not None else None,
             '30dF': round(f30, 2) if f30 is not None else None,
@@ -789,6 +814,84 @@ def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_
             'spread_bp': round(spread, 2) if spread is not None else None,
             'perp_vol': round(perp_vol, 0) if perp_vol is not None else None,
             'spot_vol': round(spot_vol, 0),
+        })
+    rows.sort(key=lambda r: (r['7dF'] is None, -(r['7dF'] or 0)))
+    return rows
+
+def get_okx_discount(bases):
+    """OKX 各标的保证金折算率(discount rate)；代币化股票目前多为 0(未开放作保证金)"""
+    result = {}
+
+    def one(base):
+        d = fetch_json("https://www.okx.com/api/v5/public/discount-rate-interest-free-quota", {'ccy': 'X' + base})
+        rate = 0.0
+        if d and d.get('code') == '0' and d.get('data'):
+            mdr = d['data'][0].get('minDiscountRate')
+            if mdr not in (None, ''):
+                try:
+                    rate = float(mdr)
+                except (ValueError, TypeError):
+                    pass
+        result[base] = rate
+    parallel_each(one, bases)
+    return result
+
+def build_okx_basis_rows(now_ms):
+    """OKX 代币化股票(X前缀现货 + 永续)：当期funding + 3d/7d/30d年化 + 期现基差 + 成交量 + 折算率；按 7dF 降序"""
+    # 现货(X前缀 -USDT)：volCcy24h 已是 USDT 成交额
+    sp = fetch_json("https://www.okx.com/api/v5/market/tickers", {'instType': 'SPOT'})
+    spot_map = {}
+    if sp and sp.get('code') == '0':
+        for x in sp.get('data', []):
+            i = x.get('instId', '')
+            if i.startswith('X') and i.endswith('-USDT'):
+                try:
+                    spot_map[i[1:-5]] = (float(x['last']), float(x['volCcy24h']))
+                except (KeyError, ValueError, TypeError):
+                    pass
+    # 永续：volCcy24h(币数) × last = USDT 成交额
+    sw = fetch_json("https://www.okx.com/api/v5/market/tickers", {'instType': 'SWAP'})
+    swap_map = {}
+    if sw and sw.get('code') == '0':
+        for x in sw.get('data', []):
+            i = x.get('instId', '')
+            if i.endswith('-USDT-SWAP'):
+                try:
+                    last = float(x['last'])
+                    swap_map[i.split('-')[0]] = (last, float(x['volCcy24h']) * last)
+                except (KeyError, ValueError, TypeError):
+                    pass
+    bases = [b for b in spot_map if b in swap_map]
+    hist_okx = get_okx_funding_history(bases)
+    fr_okx = get_okx_funding(bases)
+    disc = get_okx_discount(bases)
+    day = 86400000
+    rows = []
+    for base in bases:
+        series = hist_okx.get(base, {})
+        if not series:
+            continue
+        iv = infer_interval_hours(series)
+        f3 = window_apr(series, now_ms - 3 * day, iv)
+        f7 = window_apr(series, now_ms - 7 * day, iv)
+        f30 = window_apr(series, now_ms - 30 * day, iv)
+        perp_p, perp_vol = swap_map[base]
+        spot_p, spot_vol = spot_map[base]
+        spread = (perp_p - spot_p) / perp_p * 10000 if perp_p > 0 else None
+        cb = fr_okx.get(base, {}).get('bp', '-')
+        fund = cb if isinstance(cb, (int, float)) else None
+        rows.append({
+            'symbol': base,
+            'funding_bp': fund,
+            '3dF': round(f3, 2) if f3 is not None else None,
+            '7dF': round(f7, 2) if f7 is not None else None,
+            '30dF': round(f30, 2) if f30 is not None else None,
+            'perp': round(perp_p, 4),
+            'spot': round(spot_p, 4),
+            'spread_bp': round(spread, 2) if spread is not None else None,
+            'perp_vol': round(perp_vol, 0),
+            'spot_vol': round(spot_vol, 0),
+            'discount': disc.get(base, 0.0),
         })
     rows.sort(key=lambda r: (r['7dF'] is None, -(r['7dF'] or 0)))
     return rows
@@ -969,16 +1072,32 @@ def main():
     # ============ 表6: Binance 股票永续 Funding + 期现基差 ============
     binance_basis = build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_ms)
     print(f"\nBinance 股票永续期现基差 (仅有现货的 {len(binance_basis)} 个) — {date_str}  (按7dF降序)")
-    print(f"{'symbol':<18}{'fund(bp)':>10}{'3dF':>13}{'7dF':>13}{'30dF':>13}{'perp':>12}{'spot':>12}{'spread_bp':>13}{'合约24hVol':>16}{'现货24hVol':>16}")
-    print("-" * 134)
+    print(f"{'symbol':<18}{'fund(bp)':>10}{'3dF':>13}{'7dF':>13}{'30dF':>13}{'perp':>12}{'spot':>12}{'spread_bp':>13}{'合约24hVol':>16}{'现货24hVol':>16}{'折算率':>10}")
+    print("-" * 145)
     for r in binance_basis[:30]:
         sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
         pp = '-' if r['perp'] is None else f"{r['perp']:g}"
         st = f"{r['spot']:g}"
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
+        dr = '-' if r.get('discount') is None else f"{r['discount']:.2f}"
         print(f"{r['symbol']+'/USDT':<18}{fb:>10}{fmt_pct(r['3dF']):>13}{fmt_pct(r['7dF']):>13}"
               f"{fmt_pct(r['30dF']):>13}{pp:>12}{st:>12}{sp:>13}"
-              f"{fmt_mio(r['perp_vol']):>16}{fmt_mio(r['spot_vol']):>16}")
+              f"{fmt_mio(r['perp_vol']):>16}{fmt_mio(r['spot_vol']):>16}{dr:>10}")
+
+    # ============ 表7: OKX 代币化股票期现基差 ============
+    okx_basis = build_okx_basis_rows(now_ms)
+    print(f"\nOKX 代币化股票期现基差 (有现货的 {len(okx_basis)} 个) — {date_str}  (按7dF降序)")
+    print(f"{'symbol':<16}{'fund(bp)':>10}{'3dF':>13}{'7dF':>13}{'30dF':>13}{'perp':>12}{'spot':>12}"
+          f"{'spread_bp':>13}{'合约24hVol':>16}{'现货24hVol':>16}{'折算率':>10}")
+    print("-" * 145)
+    for r in okx_basis[:30]:
+        sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
+        pp = '-' if r['perp'] is None else f"{r['perp']:g}"
+        st = f"{r['spot']:g}"
+        fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
+        print(f"{r['symbol']+'/USDT':<16}{fb:>10}{fmt_pct(r['3dF']):>13}{fmt_pct(r['7dF']):>13}"
+              f"{fmt_pct(r['30dF']):>13}{pp:>12}{st:>12}{sp:>13}"
+              f"{fmt_mio(r['perp_vol']):>16}{fmt_mio(r['spot_vol']):>16}{r['discount']:>10.2f}")
 
     # 保存 CSV
     df = pd.DataFrame(rows_vol)
@@ -1004,10 +1123,17 @@ def main():
         append_csv(dbb, "binance_basis_log.csv")
         print(f"💾 表6已保存至：binance_basis_log.csv")
 
-    # 发送 Slack：只发表5跨所套利 + 表6期现基差（表4画像/表1成交量 只算不发）
+    if okx_basis:
+        dob = pd.DataFrame(okx_basis)
+        dob.insert(0, 'Timestamp', current_time)
+        append_csv(dob, "okx_basis_log.csv")
+        print(f"💾 表7已保存至：okx_basis_log.csv")
+
+    # 发送 Slack：表5跨所套利 + 表6 Binance期现基差 + 表7 OKX期现基差（表4画像/表1成交量 只算不发）
     if SLACK_WEBHOOK_URL:
         combined = (build_cross_blocks(cross_arb, current_time)
-                    + build_binance_basis_blocks(binance_basis, current_time))
+                    + build_binance_basis_blocks(binance_basis, current_time)
+                    + build_okx_basis_blocks(okx_basis, current_time))
         if combined:
             try:
                 resp = requests.post(SLACK_WEBHOOK_URL, json={"blocks": combined}, timeout=10)
@@ -1081,17 +1207,43 @@ def build_binance_basis_blocks(basis_rows, current_time):
         return []
     date_str = current_time[:10]
     top = basis_rows[:30]
-    header = f"{'symbol':<13}{'fund':>7}{'3dF':>9}{'7dF':>9}{'30dF':>9}{'spread':>9}{'perpVol':>10}{'spotVol':>10}"
+    header = f"{'symbol':<13}{'fund':>7}{'3dF':>9}{'7dF':>9}{'30dF':>9}{'spread':>9}{'perpVol':>10}{'spotVol':>10}{'折算':>7}"
 
     def fr(r):
         sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
+        dr = '-' if r.get('discount') is None else f"{r['discount']:.2f}"
         return (f"{r['symbol']+'/USDT':<13}{fb:>7}{fmt_pct(r['3dF']):>9}{fmt_pct(r['7dF']):>9}"
-                f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_mio(r['perp_vol']):>10}{fmt_mio(r['spot_vol']):>10}")
+                f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_mio(r['perp_vol']):>10}{fmt_mio(r['spot_vol']):>10}{dr:>7}")
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"📊 Binance股票永续期现基差 (有现货{len(top)}个) — {date_str}"}}]
     legend = ("*字段*：仅列有现货(XXXB)的股票；`fund`=当期 funding(bp) | `3dF/7dF/30dF`=近3/7/30天 funding 年化%（按 7dF 降序）\n"
               "• `spread`=(perp−spot)/perp×1e4 bp，永续相对现货的溢价（+溢价/−折价），可做期现对冲\n"
-              "• `perpVol/spotVol`=合约/现货 24h 成交额(USDT)")
+              "• `perpVol/spotVol`=合约/现货 24h 成交额(百万U) | `折算`=Binance 组合保证金折算率(公开接口)")
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": legend}})
+    for i in range(0, len(top), 15):
+        chunk = top[i:i + 15]
+        text = "```\n" + header + "\n" + "\n".join(fr(r) for r in chunk) + "\n```"
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    return blocks
+
+def build_okx_basis_blocks(basis_rows, current_time):
+    """构建表7 OKX 代币化股票期现基差 的 Slack blocks 列表"""
+    if not basis_rows:
+        return []
+    date_str = current_time[:10]
+    top = basis_rows[:30]
+    header = f"{'symbol':<12}{'fund':>7}{'3dF':>9}{'7dF':>9}{'30dF':>9}{'spread':>9}{'perpVol':>10}{'spotVol':>10}{'折算':>7}"
+
+    def fr(r):
+        sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
+        fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
+        return (f"{r['symbol']+'/USDT':<12}{fb:>7}{fmt_pct(r['3dF']):>9}{fmt_pct(r['7dF']):>9}"
+                f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_mio(r['perp_vol']):>10}{fmt_mio(r['spot_vol']):>10}"
+                f"{r['discount']:>7.2f}")
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"📊 OKX代币化股票期现基差 (有现货{len(top)}个) — {date_str}"}}]
+    legend = ("*字段*：OKX 代币化股票(现货 X前缀)；`fund`=当期 funding(bp) | `3dF/7dF/30dF`=近3/7/30天 funding 年化%（按 7dF 降序）\n"
+              "• `spread`=(perp−spot)/perp×1e4 bp，永续相对现货的溢价（+溢价/−折价），可做期现对冲\n"
+              "• `perpVol/spotVol`=合约/现货 24h 成交额(百万U) | `折算`=OKX 保证金折算率(目前 0)")
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": legend}})
     for i in range(0, len(top), 15):
         chunk = top[i:i + 15]
