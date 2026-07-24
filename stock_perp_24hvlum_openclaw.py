@@ -22,6 +22,7 @@ FEE_MODE = 'mixed'
 SIGN_CONSISTENCY_MIN = 0.8
 BREAKEVEN_DAYS_MAX = 15
 MAX_SPREAD_BP = 200        # 跨所价差超此值(bp)视为盘前/pre-IPO或价格背离，剔除（正常已上市股票通常<1%）
+OKX_DISCOUNT_AMOUNT_USD = 50000   # OKX 折算率按此仓位规模(USDT)取覆盖到的最低档
 MIN_VOLUME = 1_000_000
 
 # 股票/大宗/指数 代币列表（仅股票、重金属、指数）
@@ -818,19 +819,29 @@ def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_
     rows.sort(key=lambda r: (r['7dF'] is None, -(r['7dF'] or 0)))
     return rows
 
-def get_okx_discount(bases):
-    """OKX 各标的保证金折算率(discount rate)；代币化股票目前多为 0(未开放作保证金)"""
+def get_okx_discount(bases, amount_usd=OKX_DISCOUNT_AMOUNT_USD):
+    """OKX 保证金折算率：档位 minAmt/maxAmt 单位为 USD(经 disCcyEq=累计(maxAmt-minAmt)*discountRate 验证)。
+    按 amount_usd(默认 5 万 U)直接落档，取覆盖到的【最低档】discountRate。无数据返回 0。"""
     result = {}
 
     def one(base):
         d = fetch_json("https://www.okx.com/api/v5/public/discount-rate-interest-free-quota", {'ccy': 'X' + base})
         rate = 0.0
         if d and d.get('code') == '0' and d.get('data'):
-            mdr = d['data'][0].get('minDiscountRate')
-            if mdr not in (None, ''):
+            details = d['data'][0].get('details') or []
+            if details:
+                chosen = details[0]  # 默认第一档
+                for t in details:  # amt 单位 USD，直接比较；跨过该档 minAmt 则覆盖到此档(折算率更低)
+                    try:
+                        if amount_usd > float(t['minAmt']):
+                            chosen = t
+                        else:
+                            break
+                    except (KeyError, ValueError, TypeError):
+                        break
                 try:
-                    rate = float(mdr)
-                except (ValueError, TypeError):
+                    rate = float(chosen['discountRate'])
+                except (KeyError, ValueError, TypeError):
                     pass
         result[base] = rate
     parallel_each(one, bases)
@@ -1243,7 +1254,7 @@ def build_okx_basis_blocks(basis_rows, current_time):
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": f"📊 OKX代币化股票期现基差 (有现货{len(top)}个) — {date_str}"}}]
     legend = ("*字段*：OKX 代币化股票(现货 X前缀)；`fund`=当期 funding(bp) | `3dF/7dF/30dF`=近3/7/30天 funding 年化%（按 7dF 降序）\n"
               "• `spread`=(perp−spot)/perp×1e4 bp，永续相对现货的溢价（+溢价/−折价），可做期现对冲\n"
-              "• `perpVol/spotVol`=合约/现货 24h 成交额(百万U) | `折算`=OKX 保证金折算率(目前 0)")
+              "• `perpVol/spotVol`=合约/现货 24h 成交额(百万U) | `折算`=OKX 保证金折算率(按 5万U 仓位落档；0=未设)")
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": legend}})
     for i in range(0, len(top), 15):
         chunk = top[i:i + 15]
