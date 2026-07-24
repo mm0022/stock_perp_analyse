@@ -819,21 +819,24 @@ def build_binance_basis_rows(tokens, hist, contract_prices, vol_bn, fr_map, now_
     rows.sort(key=lambda r: (r['7dF'] is None, -(r['7dF'] or 0)))
     return rows
 
-def get_okx_discount(bases, amount_usd=OKX_DISCOUNT_AMOUNT_USD):
-    """OKX 保证金折算率：档位 minAmt/maxAmt 单位为 USD(经 disCcyEq=累计(maxAmt-minAmt)*discountRate 验证)。
-    按 amount_usd(默认 5 万 U)直接落档，取覆盖到的【最低档】discountRate。无数据返回 0。"""
+def get_okx_discount(bases, spot_map, amount_usd=OKX_DISCOUNT_AMOUNT_USD):
+    """OKX 保证金折算率：档位 minAmt/maxAmt 单位为【币数量】。
+    qty = amount_usd / 现货价，按 qty 落档，取覆盖到的最低档 discountRate。无数据/无价返回 0。
+    例：SOXL 现货 153，5万U → qty≈326 → 落 tier4(272~442) → 0.5"""
     result = {}
 
     def one(base):
         d = fetch_json("https://www.okx.com/api/v5/public/discount-rate-interest-free-quota", {'ccy': 'X' + base})
         rate = 0.0
-        if d and d.get('code') == '0' and d.get('data'):
+        sp = spot_map.get(base, (0, 0))[0]
+        if d and d.get('code') == '0' and d.get('data') and sp and sp > 0:
             details = d['data'][0].get('details') or []
             if details:
+                qty = amount_usd / sp
                 chosen = details[0]  # 默认第一档
-                for t in details:  # amt 单位 USD，直接比较；跨过该档 minAmt 则覆盖到此档(折算率更低)
+                for t in details:  # qty(币数) 跨过该档 minAmt 则覆盖到此档(折算率更低)
                     try:
-                        if amount_usd > float(t['minAmt']):
+                        if qty > float(t['minAmt']):
                             chosen = t
                         else:
                             break
@@ -875,7 +878,7 @@ def build_okx_basis_rows(now_ms):
     bases = [b for b in spot_map if b in swap_map]
     hist_okx = get_okx_funding_history(bases)
     fr_okx = get_okx_funding(bases)
-    disc = get_okx_discount(bases)
+    disc = get_okx_discount(bases, spot_map)
     day = 86400000
     rows = []
     for base in bases:
