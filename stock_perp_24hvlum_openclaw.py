@@ -825,8 +825,16 @@ def get_okx_discount(bases, spot_map, amount_usd=OKX_DISCOUNT_AMOUNT_USD):
     例：SOXL 现货 153，5万U → qty≈326 → 落 tier4(272~442) → 0.5"""
     result = {}
 
+    url = "https://www.okx.com/api/v5/public/discount-rate-interest-free-quota"
+
     def one(base):
-        d = fetch_json("https://www.okx.com/api/v5/public/discount-rate-interest-free-quota", {'ccy': 'X' + base})
+        # OKX 该接口限频严格(50011)，重试退避
+        d = None
+        for attempt in range(5):
+            d = fetch_json(url, {'ccy': 'X' + base})
+            if d and d.get('code') == '0':
+                break
+            time.sleep(0.4 * (attempt + 1))
         rate = 0.0
         sp = spot_map.get(base, (0, 0))[0]
         if d and d.get('code') == '0' and d.get('data') and sp and sp > 0:
@@ -847,7 +855,7 @@ def get_okx_discount(bases, spot_map, amount_usd=OKX_DISCOUNT_AMOUNT_USD):
                 except (KeyError, ValueError, TypeError):
                     pass
         result[base] = rate
-    parallel_each(one, bases)
+    parallel_each(one, bases, workers=3)  # 低并发避免限频
     return result
 
 def build_okx_basis_rows(now_ms):
