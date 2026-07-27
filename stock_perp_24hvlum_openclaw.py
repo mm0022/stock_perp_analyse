@@ -64,6 +64,12 @@ def fmt_mio(v):
         return '-'
     return f"{v/1e6:.1f}M"
 
+def fmt_mio2(v):
+    """持仓额等小额按百万(mio)显示，2 位小数(如 0.05M)"""
+    if not isinstance(v, (int, float)):
+        return '-'
+    return f"{v/1e6:.2f}M"
+
 def fmt_pct(v):
     """年化/波动 带 % 号（1位小数）"""
     return f"{v:.1f}%" if isinstance(v, (int, float)) else '-'
@@ -1158,7 +1164,7 @@ def main():
         st = f"{r['spot']:g}"
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
         dr = '-' if r.get('discount') is None else f"{r['discount']:.2f}"
-        ps = fmt_mio(r['pos_usd']) if r.get('pos_usd') is not None else '-'
+        ps = fmt_mio2(r['pos_usd']) if r.get('pos_usd') is not None else '-'
         print(f"{r['symbol']+'/USDT':<18}{fb:>10}{fmt_pct(r['3dF']):>13}{fmt_pct(r['7dF']):>13}"
               f"{fmt_pct(r['30dF']):>13}{pp:>12}{st:>12}{sp:>13}"
               f"{fmt_mio(r['perp_vol']):>16}{fmt_mio(r['spot_vol']):>16}{dr:>10}{ps:>12}")
@@ -1176,7 +1182,7 @@ def main():
         pp = '-' if r['perp'] is None else f"{r['perp']:g}"
         st = f"{r['spot']:g}"
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
-        ps = fmt_mio(r['pos_usd']) if r.get('pos_usd') is not None else '-'
+        ps = fmt_mio2(r['pos_usd']) if r.get('pos_usd') is not None else '-'
         print(f"{r['symbol']+'/USDT':<16}{fb:>10}{fmt_pct(r['3dF']):>13}{fmt_pct(r['7dF']):>13}"
               f"{fmt_pct(r['30dF']):>13}{pp:>12}{st:>12}{sp:>13}"
               f"{fmt_mio(r['perp_vol']):>16}{fmt_mio(r['spot_vol']):>16}{r['discount']:>10.2f}{ps:>12}")
@@ -1295,7 +1301,7 @@ def build_binance_basis_blocks(basis_rows, current_time):
         sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
         dr = '-' if r.get('discount') is None else f"{r['discount']:.2f}"
-        ps = fmt_mio(r['pos_usd']) if r.get('pos_usd') is not None else '-'
+        ps = fmt_mio2(r['pos_usd']) if r.get('pos_usd') is not None else '-'
         return (f"{r['symbol']+'/USDT':<13}{fb:>7}{fmt_pct(r['3dF']):>9}{fmt_pct(r['7dF']):>9}"
                 f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_mio(r['perp_vol']):>10}{fmt_mio(r['spot_vol']):>10}{dr:>7}{ps:>8}")
     n_pos = sum(1 for r in basis_rows if r.get('pos_usd') is not None)
@@ -1321,7 +1327,7 @@ def build_okx_basis_blocks(basis_rows, current_time):
     def fr(r):
         sp = '-' if r['spread_bp'] is None else f"{r['spread_bp']:.1f}"
         fb = '-' if r['funding_bp'] is None else f"{r['funding_bp']:g}"
-        ps = fmt_mio(r['pos_usd']) if r.get('pos_usd') is not None else '-'
+        ps = fmt_mio2(r['pos_usd']) if r.get('pos_usd') is not None else '-'
         return (f"{r['symbol']+'/USDT':<12}{fb:>7}{fmt_pct(r['3dF']):>9}{fmt_pct(r['7dF']):>9}"
                 f"{fmt_pct(r['30dF']):>9}{sp:>9}{fmt_mio(r['perp_vol']):>10}{fmt_mio(r['spot_vol']):>10}"
                 f"{r['discount']:>7.2f}{ps:>8}")
