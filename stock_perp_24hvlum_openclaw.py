@@ -104,7 +104,9 @@ def get_biyi_positions():
         if r.status_code != 200:
             print(f"⚠️ Biyi 持仓获取失败: {r.status_code}")
             return out
-        strat = [s for s in (r.json().get('data') or []) if s.get('strategyType') == 'LONGSHORT']
+        # 只算永续腿(SM-PU)，忽略现货腿(SS-PU)——同一对冲仓两腿名义相等，累加会翻倍
+        strat = [s for s in (r.json().get('data') or [])
+                 if s.get('strategyType') == 'LONGSHORT' and s.get('productType') == 'SM-PU']
         for s in strat:
             t = s.get('ticker', '')
             if '/' not in t:
