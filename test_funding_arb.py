@@ -31,6 +31,28 @@ def test_infer_interval_robust_to_outlier():
     s = {0: 0.1, 60000: 0.1, 14400000: 0.1, 28800000: 0.1, 43200000: 0.1}
     assert abs(m.infer_interval_hours(s) - 4.0) < 1e-9
 
+def test_current_interval_prefers_declared():
+    # 交易所声明 4h、历史众数 8h（刚改过周期）→ 取声明值
+    assert m.current_interval_hours({'interval_h': 4.0}, 8.0) == 4.0
+
+def test_current_interval_falls_back_to_inferred():
+    assert m.current_interval_hours({}, 8.0) == 8.0
+    assert m.current_interval_hours({'interval_h': None}, 4.0) == 4.0
+    assert m.current_interval_hours(None, 8.0) == 8.0
+
+def test_current_interval_zero_declared_treated_as_missing():
+    assert m.current_interval_hours({'interval_h': 0}, 8.0) == 8.0
+
+def test_current_interval_none_when_both_missing():
+    assert m.current_interval_hours({}, None) is None
+
+def test_fmt_hours():
+    assert m.fmt_hours(8.0) == '8h'
+    assert m.fmt_hours(4) == '4h'
+    assert m.fmt_hours(1.5) == '1.5h'
+    assert m.fmt_hours(None) == '-'
+    assert m.fmt_hours('-') == '-'
+
 def test_window_apr_basic():
     # 全在窗口内，均值0.0001，4h年化 = 0.0001*(24/4)*365*100 = 21.9
     s = _series([0.0001]*5)
