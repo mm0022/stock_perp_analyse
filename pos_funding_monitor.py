@@ -24,8 +24,33 @@ import requests
 import stock_perp_24hvlum_openclaw as sp
 
 ALERT_FUNDING_BP = float(os.environ.get("ALERT_FUNDING_BP", "-5"))
+PROBE_URL = "https://fapi.binance.com/fapi/v1/ping"
 WEBHOOK = os.environ.get("ALERT_SLACK_WEBHOOK_URL") or os.environ.get("SLACK_WEBHOOK_URL", "")
 EXCHANGES = ('Binance', 'OKX', 'Bybit')
+
+# ====================== 网络出口 ======================
+
+def pick_proxies():
+    """探测可用出口并写回 sp.proxies，返回 (proxies, 描述, error)
+
+    本机出口在直连和代理之间来回切（代理软件时开时关），实测同一天内两种情况都出现过：
+    直连通/代理拒连，以及直连全挂/代理通。硬编码任一种都会周期性让监控整轮失效，
+    所以每轮启动时按 直连 → PROXY_URL 顺序探测，取第一个通的。
+    """
+    candidates = [({}, '直连')]
+    proxy_url = os.environ.get("PROXY_URL", "")
+    if proxy_url:
+        candidates.append(({'http': proxy_url, 'https': proxy_url}, f'代理 {proxy_url}'))
+    for prox, name in candidates:
+        try:
+            if requests.get(PROBE_URL, proxies=prox, timeout=8).status_code == 200:
+                sp.proxies = prox
+                return prox, name, None
+        except Exception:
+            continue
+    tried = ' / '.join(n for _, n in candidates)
+    return None, tried, f"网络出口全部不通（已试 {tried}），本轮无法取任何行情"
+
 
 # ====================== 持仓 ======================
 
@@ -485,12 +510,18 @@ def main(dry_run=False):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n🕒 持仓 funding 监控 {now_str}（阈值 {ALERT_FUNDING_BP:g}bp）")
 
+    _, exit_name, net_err = pick_proxies()
+    print(f"🌐 出口：{exit_name}" if not net_err else f"⚠️ {net_err}")
+
     positions, pos_err = get_positions()
-    problems = [pos_err] if pos_err else []
+    problems = [p for p in (net_err, pos_err) if p]
     n_pos = sum(len(positions[ex]) for ex in EXCHANGES)
     print("📦 持仓币：" + "，".join(f"{ex} {len(positions[ex])}" for ex in EXCHANGES) + f"（共 {n_pos}）")
 
-    rows, collect_problems = ([], []) if pos_err else collect_rows(positions)
+    if pos_err or net_err:
+        rows, collect_problems = [], []   # 出口或持仓不可信时不再发无意义的行情请求
+    else:
+        rows, collect_problems = collect_rows(positions)
     problems += collect_problems
 
     for r in sorted(rows, key=lambda r: r['bp']):
