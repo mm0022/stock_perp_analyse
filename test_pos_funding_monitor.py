@@ -222,6 +222,83 @@ def test_price_parse_rejects_zero_and_garbage():
     assert pm._f('63.70000000') == 63.7
 
 
+# ---- premium → funding 公式（已用两所实测校准）----
+
+def test_predicted_funding_matches_real_observations():
+    # 这 5 组是 Binance/OKX 实测的 (premium, 利率) → funding，公式必须复现
+    assert abs(pm.predicted_funding(-13.58, 0.0) - (-8.58)) < 0.01   # Binance 股票
+    assert abs(pm.predicted_funding(9.57, 0.0) - 4.57) < 0.01        # Binance 股票
+    assert abs(pm.predicted_funding(-4.66, 0.0) - 0.0) < 0.01        # OKX 股票，死区内
+    assert abs(pm.predicted_funding(-4.56, 1.0) - 0.44) < 0.01       # Binance BTC
+    assert abs(pm.predicted_funding(2.0, 1.0) - 1.0) < 0.01          # DOGE，死区内
+
+
+def test_dead_zone_centers_on_interest_rate():
+    # 股票永续利率=0 → 死区内 funding 恰好 0
+    for p in (-5.0, -2.0, 0.0, 3.0, 5.0):
+        assert abs(pm.predicted_funding(p, 0.0)) < 1e-9
+    # 加密利率=1bp → 死区内 funding 恒为 1bp，永不归零
+    for p in (-4.0, 0.0, 6.0):
+        assert abs(pm.predicted_funding(p, 1.0) - 1.0) < 1e-9
+
+
+def test_predicted_funding_respects_cap():
+    # premium −500bp，未夹则为 −495bp；cap=100bp 应夹到 −100bp
+    assert pm.predicted_funding(-500.0, 0.0) == -495.0
+    assert pm.predicted_funding(-500.0, 0.0, cap_bp=100.0) == -100.0
+
+
+def test_predicted_funding_none_on_missing_input():
+    assert pm.predicted_funding(None, 0.0) is None
+    assert pm.predicted_funding(-8.0, None) is None   # Bybit 无利率项
+
+
+def test_slack_equals_negative_funding_once_breached():
+    # 跌破后 slack 就等于负 funding —— 对任何利率都成立，这才是 slack 的意义
+    for p in (-6.0, -8.0, -13.58, -20.0):
+        for ir in (0.0, 1.0):
+            assert abs(pm.funding_slack(p) - pm.predicted_funding(p, ir)) < 1e-9
+
+
+def test_slack_positive_means_not_bleeding():
+    assert pm.funding_slack(-3.0) == 2.0      # 还剩 2bp 缓冲
+    assert pm.funding_slack(0.0) == 5.0
+    assert pm.funding_slack(-5.0) == 0.0      # 正好在边缘
+
+
+def test_slack_sign_agrees_with_predicted_funding_sign():
+    """回归：曾把 slack 定义成依赖利率，导致 BTC(prem=-4.2,利率=1bp) 被误报为流血
+    —— 实际 predicted=+0.8bp 是正的。funding<0 的充要条件只是 prem<-5bp。"""
+    for p in (-20.0, -6.0, -5.01, -4.2, -3.0, 0.0, 10.0):
+        for ir in (0.0, 1.0):
+            assert (pm.funding_slack(p) < 0) == (pm.predicted_funding(p, ir) < 0), (p, ir)
+
+
+def test_slack_available_without_interest_rate():
+    # Bybit 不给利率项，slack 仍必须能算（不依赖利率）
+    assert pm.funding_slack(-8.0) == -3.0
+
+
+def test_slack_none_without_premium():
+    assert pm.funding_slack(None) is None
+
+
+# ---- 费率/相对值解析 ----
+
+def test_bp_parse_keeps_zero_as_valid():
+    # 0 是合法利率（股票永续就是 0），不能当缺失
+    assert pm._bp('0') == 0.0
+    assert pm._bp('0.0001') == 1.0
+    assert pm._bp(None) is None and pm._bp('') is None
+
+
+def test_rel_bp():
+    assert abs(pm._rel_bp('101', '100') - 100.0) < 1e-9
+    assert abs(pm._rel_bp('99', '100') - (-100.0)) < 1e-9
+    assert pm._rel_bp('100', '0') is None
+    assert pm._rel_bp(None, '100') is None
+
+
 # ---- Slack blocks ----
 
 def test_no_alerts_no_problems_means_no_message():

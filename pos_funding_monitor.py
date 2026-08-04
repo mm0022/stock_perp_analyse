@@ -52,6 +52,58 @@ def pick_proxies():
     return None, tried, f"网络出口全部不通（已试 {tried}），本轮无法取任何行情"
 
 
+# ====================== premium 与 funding 预测 ======================
+# 两所公式相同（已在 Binance/OKX × 股票/加密 共 5 个案例上数值验证）：
+#     funding = clamp( premium + clamp(利率 − premium, ±5bp), ±cap )
+# 即以「利率」为中心存在一个 ±5bp 的死区：premium 落在死区内，funding 恒等于利率。
+# 股票永续两所利率都是 0 → 死区 [−5bp, +5bp]，funding 恰好为 0（实测 37~53% 的期数如此）。
+# 加密永续利率 1bp → 死区 [−4bp, +6bp]，funding 恒为 1bp，永不归零。
+DEAD_ZONE_BP = 5.0
+
+
+def _bp(v):
+    """接口返回的小数费率 → bp；缺失/非法返回 None（0 是合法值，不能当缺失）"""
+    try:
+        return float(v) * 10000
+    except (TypeError, ValueError):
+        return None
+
+
+def _rel_bp(a, b):
+    """(a − b) / b × 1e4；任一缺失或 b<=0 返回 None"""
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return None
+    return (a - b) / b * 10000 if b > 0 else None
+
+
+def predicted_funding(prem_bp, interest_bp, cap_bp=None):
+    """由当前 premium 推算本期 funding(bp)。缺 premium 或利率则返回 None"""
+    if prem_bp is None or interest_bp is None:
+        return None
+    adj = max(-DEAD_ZONE_BP, min(DEAD_ZONE_BP, interest_bp - prem_bp))
+    f = prem_bp + adj
+    if cap_bp:
+        f = max(-cap_bp, min(cap_bp, f))
+    return f
+
+
+def funding_slack(prem_bp):
+    """premium 距「开始付负 funding」还有几 bp = prem + 5bp。
+
+    不需要利率：由公式可推出 funding<0 的充要条件就是 premium < −5bp（对任何 利率≥0 成立，
+    两所实测利率为 0 或 1bp）。证明：
+      prem ≥ 利率−5（死区内）→ funding = 利率 ≥ 0，不为负
+      prem < 利率−5         → funding = prem+5，仅当 prem < −5 才为负
+    所以 >0 = 不流血；≤0 = 已在流血，且此值就等于负 funding 的大小。
+    好处是 Bybit 不给利率项也能算。
+    """
+    if prem_bp is None:
+        return None
+    return prem_bp + DEAD_ZONE_BP
+
+
 # ====================== 持仓 ======================
 
 def _exchange_of(account_map):
@@ -198,11 +250,15 @@ def binance_perp_funding():
                     and s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING'):
                 universe[s['symbol'].replace('USDT', '')] = s['symbol']
 
-    interval_map = {}
+    interval_map, cap_map = {}, {}
     fi = sp.fetch_json("https://fapi.binance.com/fapi/v1/fundingInfo")
     if isinstance(fi, list):
         for it in fi:
             interval_map[it.get('symbol')] = it.get('fundingIntervalHours')
+            try:
+                cap_map[it['symbol']] = abs(float(it['adjustedFundingRateCap'])) * 10000
+            except (KeyError, TypeError, ValueError):
+                pass
 
     funding = {}
     prem = sp.fetch_json("https://fapi.binance.com/fapi/v1/premiumIndex")
@@ -217,7 +273,14 @@ def binance_perp_funding():
             except (TypeError, ValueError):
                 continue
             funding[base] = {'bp': rate * 10000,
-                             'interval_h': float(interval_map.get(sym) or 8)}
+                             'interval_h': float(interval_map.get(sym) or 8),
+                             'cap_bp': cap_map.get(sym),
+                             'interest_bp': _bp(p.get('interestRate')),
+                             # Binance 不暴露原始 premium index；用 (mark−index) 近似。
+                             # 注意 markPrice 本身已含 funding basis 的移动平均，所以这是
+                             # 平滑后的值，比 OKX 的冲击价 premium 钝，会低估瞬时尖峰。
+                             'prem_bp': _rel_bp(p.get('markPrice'), p.get('indexPrice')),
+                             'prem_src': 'mark−idx'}
     return universe, funding
 
 
@@ -246,7 +309,13 @@ def bybit_perp_funding():
             except (TypeError, ValueError):
                 continue
             funding[base] = {'bp': rate * 10000,
-                             'interval_h': float(interval_map.get(sym) or 8)}
+                             'interval_h': float(interval_map.get(sym) or 8),
+                             'cap_bp': None,
+                             # Bybit 不暴露利率项，没有它无法定位死区中心 → 不做 funding 预测，
+                             # 只报 premium 本身。宁可显示 '-' 也不猜一个值。
+                             'interest_bp': None,
+                             'prem_bp': _rel_bp(it.get('markPrice'), it.get('indexPrice')),
+                             'prem_src': 'mark−idx'}
     return universe, funding
 
 
@@ -277,7 +346,13 @@ def okx_funding(bases):
         except (TypeError, ValueError):
             return
         interval = (nt - ft) / 3600000 if nt > ft > 0 else 8
-        out[base] = {'bp': rate * 10000, 'interval_h': float(interval)}
+        out[base] = {'bp': rate * 10000, 'interval_h': float(interval),
+                     'cap_bp': _bp(fr.get('maxFundingRate')),
+                     'interest_bp': _bp(fr.get('interestRate')),
+                     # OKX 官方 premium：按 impactValue(如 SNDK $1万) 的冲击价算，
+                     # 不是盘口中价，也不是 mark。这是唯一一所直接给出 funding 输入量的。
+                     'prem_bp': _bp(fr.get('premium')),
+                     'prem_src': '官方'}
 
     sp.parallel_each(_one, list(bases), workers=3)
     return out
@@ -329,8 +404,13 @@ def collect_rows(positions):
             if f is None:
                 missing.append(perp)
                 continue
+            prem, ir = f.get('prem_bp'), f.get('interest_bp')
             rows.append({'exchange': ex, 'pos_base': pos_base, 'perp_base': perp,
-                         'bp': f['bp'], 'interval_h': f['interval_h'], 'pos_usd': pos_usd})
+                         'bp': f['bp'], 'interval_h': f['interval_h'], 'pos_usd': pos_usd,
+                         'prem_bp': prem, 'prem_src': f.get('prem_src'),
+                         'interest_bp': ir, 'cap_bp': f.get('cap_bp'),
+                         'pred_bp': predicted_funding(prem, ir, f.get('cap_bp')),
+                         'slack_bp': funding_slack(prem)})
         if missing and len(missing) == len(matched[ex]):
             problems.append(f"{ex}: {len(missing)} 个持仓币的 funding 全部取不到（代理/限频/接口变更）")
         elif missing:
@@ -464,11 +544,13 @@ def build_blocks(alerts, problems, rows_total, now_str, threshold=ALERT_FUNDING_
         # 表头用 ASCII：中文在等宽字体里占 2 格，Python 的 :<8 按字符数算会错位
         lines = ["```",
                  (f"{'ex':<8} {'sym':<10} {'funding':>10} {'int':>5} {'pos':>8} "
+                  f"{'prem':>7} {'slack':>7} "
                   f"{'spotAsk':>11} {'perpBid':>11} {'sprd':>8}")]
         for r in alerts:
             lines.append(f"{r['exchange']:<8} {r['perp_base']:<10} "
                          f"{r['bp']:>8.2f}bp {_fmt_interval(r['interval_h']):>5} "
                          f"{sp.fmt_mio2(r['pos_usd']):>8} "
+                         f"{_fmt_bp(r.get('prem_bp')):>7} {_fmt_bp(r.get('slack_bp')):>7} "
                          f"{_fmt_px(r.get('spot_ask')):>11} {_fmt_px(r.get('perp_bid')):>11} "
                          f"{_fmt_bp(r.get('spread_bp')):>8}")
         lines.append("```")
@@ -480,6 +562,10 @@ def build_blocks(alerts, problems, rows_total, now_str, threshold=ALERT_FUNDING_
                 "text": (f"当期单期费率 < {threshold:g}bp 即告警｜共扫描 {rows_total} 个持仓币｜"
                          "方向按 LONGSHORT=空永续推定，负费率=我们付钱｜"
                          "同 -5bp 在 1h 周期的出血速度是 8h 的 8 倍\n"
+                         "`prem`=永续相对指数的偏离(bp)，funding 的直接输入量｜"
+                         f"`slack`=prem+{DEAD_ZONE_BP:g}bp，即距 funding 转负还剩几 bp："
+                         "**>0 不流血，<0 时其值就等于负 funding 的大小**\n"
+                         "OKX 的 prem 是官方冲击价口径；Binance/Bybit 用 (mark−index) 近似，偏平滑会低估尖峰\n"
                          "`sprd`=(现货卖一−合约买一)/现货卖一×1e4 bp，开仓方向；"
                          "放大合约(1000PEPE等)的 `perpBid` 已按倍数折回单币价；`-`=盘口未取到")}]},
         ]
@@ -524,10 +610,20 @@ def main(dry_run=False):
         rows, collect_problems = collect_rows(positions)
     problems += collect_problems
 
-    for r in sorted(rows, key=lambda r: r['bp']):
-        flag = "🚨" if r['bp'] < ALERT_FUNDING_BP else "  "
-        print(f"{flag} {r['exchange']:<8} {r['perp_base']:<10} {r['bp']:>8.2f}bp "
-              f"{_fmt_interval(r['interval_h']):>5} {sp.fmt_mio2(r['pos_usd']):>9}")
+    if rows:
+        print(f"   {'ex':<8} {'sym':<10} {'funding':>9} {'int':>4} {'pos':>8} "
+              f"{'prem':>8} {'slack':>7} {'pred':>8}  premium来源")
+    for r in sorted(rows, key=lambda r: (r['slack_bp'] if r['slack_bp'] is not None else 999, r['bp'])):
+        flag = "🚨" if r['bp'] < ALERT_FUNDING_BP else ("⚠️" if (r['slack_bp'] or 999) < 0 else "  ")
+        print(f"{flag} {r['exchange']:<8} {r['perp_base']:<10} {r['bp']:>7.2f}bp "
+              f"{_fmt_interval(r['interval_h']):>4} {sp.fmt_mio2(r['pos_usd']):>8} "
+              f"{_fmt_bp(r.get('prem_bp')):>8} {_fmt_bp(r.get('slack_bp')):>7} "
+              f"{_fmt_bp(r.get('pred_bp')):>8}  {r.get('prem_src') or '-'}")
+    bleeding = sorted((r for r in rows if (r.get('slack_bp') is not None and r['slack_bp'] < 0)),
+                      key=lambda r: r['slack_bp'])
+    if bleeding:
+        print(f"   ⚠️ {len(bleeding)} 个 premium 已跌破 −{DEAD_ZONE_BP:g}bp，下期 funding 预计为负: "
+              + ", ".join(f"{r['exchange']}/{r['perp_base']}({r['slack_bp']:.1f}bp)" for r in bleeding))
 
     alerts = pick_alerts(rows)
     if alerts:
