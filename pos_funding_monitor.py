@@ -17,6 +17,7 @@
 """
 import os
 import sys
+import time
 from datetime import datetime
 
 import requests
@@ -69,6 +70,14 @@ def _bp(v):
         return None
 
 
+def _ms(v):
+    """毫秒时间戳 → int；缺失/非法返回 None"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _rel_bp(a, b):
     """(a − b) / b × 1e4；任一缺失或 b<=0 返回 None"""
     try:
@@ -78,8 +87,17 @@ def _rel_bp(a, b):
     return (a - b) / b * 10000 if b > 0 else None
 
 
-def predicted_funding(prem_bp, interest_bp, cap_bp=None):
-    """由当前 premium 推算本期 funding(bp)。缺 premium 或利率则返回 None"""
+def funding_if_premium_held(prem_bp, interest_bp, cap_bp=None):
+    """把当前瞬时 premium 代入公式的结果(bp)——这是「若 premium 恒定不变」的假想值，
+    **不是对下期 funding 的预测**。
+
+    实测过它作为预测有多差（OKX 15 个标的，瞬时 premium vs 本期实际累积 funding）：
+        SNDK 瞬时-22.56bp → 假想-17.56bp，实际累积仅 -4.10bp（差 13.46bp）
+        CRCL/MU/PEPE/LINK 连正负号都相反
+        平均绝对偏差 1.68bp，最大 13.46bp，15 个里 4 个符号判错
+    因为交易所的 funding 是整个结算周期(8h)内 premium 的时间加权平均，瞬时值噪声极大。
+    仅用于单测校准公式本身，不进入告警判断。
+    """
     if prem_bp is None or interest_bp is None:
         return None
     adj = max(-DEAD_ZONE_BP, min(DEAD_ZONE_BP, interest_bp - prem_bp))
@@ -89,15 +107,30 @@ def predicted_funding(prem_bp, interest_bp, cap_bp=None):
     return f
 
 
-def funding_slack(prem_bp):
-    """premium 距「开始付负 funding」还有几 bp = prem + 5bp。
+def period_elapsed_pct(next_funding_ms, interval_h, now_ms):
+    """本期已过百分比 0..100。累积 funding 还剩多少变动空间取决于它：
+    已过 90% 时当前累积值基本锁定；已过 10% 时还能大幅漂移。"""
+    if not next_funding_ms or not interval_h or interval_h <= 0:
+        return None
+    span = interval_h * 3600_000
+    remain = next_funding_ms - now_ms
+    if remain < 0 or remain > span:
+        return None
+    return (1 - remain / span) * 100
 
-    不需要利率：由公式可推出 funding<0 的充要条件就是 premium < −5bp（对任何 利率≥0 成立，
-    两所实测利率为 0 或 1bp）。证明：
-      prem ≥ 利率−5（死区内）→ funding = 利率 ≥ 0，不为负
+
+def funding_slack(prem_bp):
+    """瞬时 premium 离「负 funding 分界线(−5bp)」的距离 = prem + 5bp。
+
+    这是一个**瞬时压力**读数，不是对下期 funding 的预测——见 funding_if_premium_held 的实测偏差。
+    类比：slack 是时速表（此刻往哪个方向走多快），funding 列是里程表（本期已累积多少）。
+      >0  此刻不在流血区，premium 还要再跌这么多才会开始拖低累积值
+      <0  此刻处在流血区，若持续停留会把累积 funding 往负拖
+
+    分界线为何是 −5bp（与利率无关，只要利率≥0）：
+      prem ≥ 利率−5（死区内）→ funding = 利率 ≥ 0
       prem < 利率−5         → funding = prem+5，仅当 prem < −5 才为负
-    所以 >0 = 不流血；≤0 = 已在流血，且此值就等于负 funding 的大小。
-    好处是 Bybit 不给利率项也能算。
+    所以 Bybit 不给利率项也能算。
     """
     if prem_bp is None:
         return None
@@ -280,7 +313,8 @@ def binance_perp_funding():
                              # 注意 markPrice 本身已含 funding basis 的移动平均，所以这是
                              # 平滑后的值，比 OKX 的冲击价 premium 钝，会低估瞬时尖峰。
                              'prem_bp': _rel_bp(p.get('markPrice'), p.get('indexPrice')),
-                             'prem_src': 'mark−idx'}
+                             'prem_src': 'mark−idx',
+                             'next_ms': _ms(p.get('nextFundingTime'))}
     return universe, funding
 
 
@@ -315,7 +349,8 @@ def bybit_perp_funding():
                              # 只报 premium 本身。宁可显示 '-' 也不猜一个值。
                              'interest_bp': None,
                              'prem_bp': _rel_bp(it.get('markPrice'), it.get('indexPrice')),
-                             'prem_src': 'mark−idx'}
+                             'prem_src': 'mark−idx',
+                             'next_ms': _ms(it.get('nextFundingTime'))}
     return universe, funding
 
 
@@ -352,7 +387,8 @@ def okx_funding(bases):
                      # OKX 官方 premium：按 impactValue(如 SNDK $1万) 的冲击价算，
                      # 不是盘口中价，也不是 mark。这是唯一一所直接给出 funding 输入量的。
                      'prem_bp': _bp(fr.get('premium')),
-                     'prem_src': '官方'}
+                     'prem_src': '官方',
+                     'next_ms': _ms(fr.get('fundingTime'))}
 
     sp.parallel_each(_one, list(bases), workers=3)
     return out
@@ -367,6 +403,7 @@ def collect_rows(positions):
     problems: 数据可信度问题的人类可读描述列表
     """
     rows, problems = [], []
+    now_ms = int(time.time() * 1000)
 
     bn_universe, bn_funding = binance_perp_funding()
     bb_universe, bb_funding = bybit_perp_funding()
@@ -409,8 +446,8 @@ def collect_rows(positions):
                          'bp': f['bp'], 'interval_h': f['interval_h'], 'pos_usd': pos_usd,
                          'prem_bp': prem, 'prem_src': f.get('prem_src'),
                          'interest_bp': ir, 'cap_bp': f.get('cap_bp'),
-                         'pred_bp': predicted_funding(prem, ir, f.get('cap_bp')),
-                         'slack_bp': funding_slack(prem)})
+                         'slack_bp': funding_slack(prem),
+                         'elapsed_pct': period_elapsed_pct(f.get('next_ms'), f['interval_h'], now_ms)})
         if missing and len(missing) == len(matched[ex]):
             problems.append(f"{ex}: {len(missing)} 个持仓币的 funding 全部取不到（代理/限频/接口变更）")
         elif missing:
@@ -543,12 +580,14 @@ def build_blocks(alerts, problems, rows_total, now_str, threshold=ALERT_FUNDING_
     if alerts:
         # 表头用 ASCII：中文在等宽字体里占 2 格，Python 的 :<8 按字符数算会错位
         lines = ["```",
-                 (f"{'ex':<8} {'sym':<10} {'funding':>10} {'int':>5} {'pos':>8} "
+                 (f"{'ex':<8} {'sym':<10} {'funding':>10} {'int':>5} {'已过':>6} {'pos':>8} "
                   f"{'prem':>7} {'slack':>7} "
                   f"{'spotAsk':>11} {'perpBid':>11} {'sprd':>8}")]
         for r in alerts:
+            ep = r.get('elapsed_pct')
             lines.append(f"{r['exchange']:<8} {r['perp_base']:<10} "
                          f"{r['bp']:>8.2f}bp {_fmt_interval(r['interval_h']):>5} "
+                         f"{(f'{ep:.0f}%' if ep is not None else '-'):>6} "
                          f"{sp.fmt_mio2(r['pos_usd']):>8} "
                          f"{_fmt_bp(r.get('prem_bp')):>7} {_fmt_bp(r.get('slack_bp')):>7} "
                          f"{_fmt_px(r.get('spot_ask')):>11} {_fmt_px(r.get('perp_bid')):>11} "
@@ -562,9 +601,12 @@ def build_blocks(alerts, problems, rows_total, now_str, threshold=ALERT_FUNDING_
                 "text": (f"当期单期费率 < {threshold:g}bp 即告警｜共扫描 {rows_total} 个持仓币｜"
                          "方向按 LONGSHORT=空永续推定，负费率=我们付钱｜"
                          "同 -5bp 在 1h 周期的出血速度是 8h 的 8 倍\n"
-                         "`prem`=永续相对指数的偏离(bp)，funding 的直接输入量｜"
-                         f"`slack`=prem+{DEAD_ZONE_BP:g}bp，即距 funding 转负还剩几 bp："
-                         "**>0 不流血，<0 时其值就等于负 funding 的大小**\n"
+                         "`funding` 是本期累积到现在的值（已是周期内的时间加权平均，权威口径）｜"
+                         "`已过`=本期走完百分比，越接近 100% 累积值越锁定\n"
+                         "`prem`=**瞬时**永续/指数偏离｜"
+                         f"`slack`=prem+{DEAD_ZONE_BP:g}bp，<0 表示此刻在流血区。"
+                         "两者都是瞬时压力读数，**不能当下期 funding 的预测**"
+                         "（实测瞬时值代入公式最大偏 13bp，15 个里 4 个符号都反）\n"
                          "OKX 的 prem 是官方冲击价口径；Binance/Bybit 用 (mark−index) 近似，偏平滑会低估尖峰\n"
                          "`sprd`=(现货卖一−合约买一)/现货卖一×1e4 bp，开仓方向；"
                          "放大合约(1000PEPE等)的 `perpBid` 已按倍数折回单币价；`-`=盘口未取到")}]},
@@ -611,18 +653,20 @@ def main(dry_run=False):
     problems += collect_problems
 
     if rows:
-        print(f"   {'ex':<8} {'sym':<10} {'funding':>9} {'int':>4} {'pos':>8} "
-              f"{'prem':>8} {'slack':>7} {'pred':>8}  premium来源")
+        print(f"   {'ex':<8} {'sym':<10} {'累积funding':>11} {'int':>4} {'本期已过':>8} "
+              f"{'pos':>8} {'瞬时prem':>9} {'slack':>7}  prem来源")
     for r in sorted(rows, key=lambda r: (r['slack_bp'] if r['slack_bp'] is not None else 999, r['bp'])):
         flag = "🚨" if r['bp'] < ALERT_FUNDING_BP else ("⚠️" if (r['slack_bp'] or 999) < 0 else "  ")
-        print(f"{flag} {r['exchange']:<8} {r['perp_base']:<10} {r['bp']:>7.2f}bp "
-              f"{_fmt_interval(r['interval_h']):>4} {sp.fmt_mio2(r['pos_usd']):>8} "
-              f"{_fmt_bp(r.get('prem_bp')):>8} {_fmt_bp(r.get('slack_bp')):>7} "
-              f"{_fmt_bp(r.get('pred_bp')):>8}  {r.get('prem_src') or '-'}")
+        ep = r.get('elapsed_pct')
+        print(f"{flag} {r['exchange']:<8} {r['perp_base']:<10} {r['bp']:>9.2f}bp "
+              f"{_fmt_interval(r['interval_h']):>4} {(f'{ep:.0f}%' if ep is not None else '-'):>8} "
+              f"{sp.fmt_mio2(r['pos_usd']):>8} "
+              f"{_fmt_bp(r.get('prem_bp')):>9} {_fmt_bp(r.get('slack_bp')):>7}  {r.get('prem_src') or '-'}")
     bleeding = sorted((r for r in rows if (r.get('slack_bp') is not None and r['slack_bp'] < 0)),
                       key=lambda r: r['slack_bp'])
     if bleeding:
-        print(f"   ⚠️ {len(bleeding)} 个 premium 已跌破 −{DEAD_ZONE_BP:g}bp，下期 funding 预计为负: "
+        print(f"   ⚠️ {len(bleeding)} 个此刻 premium 在流血区(<−{DEAD_ZONE_BP:g}bp)，"
+              f"若持续停留会把累积 funding 往负拖（瞬时压力，非预测）: "
               + ", ".join(f"{r['exchange']}/{r['perp_base']}({r['slack_bp']:.1f}bp)" for r in bleeding))
 
     alerts = pick_alerts(rows)
