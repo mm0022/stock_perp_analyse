@@ -1,3 +1,46 @@
+r"""股票/大宗/指数永续 funding 与期现基差分析（7 张表 + Slack 推送）
+
+产出：
+    表1 24h成交量(6所横向对比)  表4 单所 funding 画像(3d/7d/30d年化+波动+OI+现货可用性)
+    表5 跨所净 funding 套利(高FR所做空/低FR所做多，含回本天数与符号一致率)
+    表6 Binance 股票永续期现基差   表7 OKX 代币化股票期现基差（两表标注 Biyi 实盘持仓）
+落盘 CSV：crypto_stock_volume_log / funding_profile_log / cross_funding_arb_log /
+          binance_basis_log_new / okx_basis_log_new
+Slack 只推表5/6/7（表1、表4 只算不发）。
+
+用法（Windows / macOS / Linux 完全相同，不需要任何包装脚本）：
+    python stock_perp_24hvlum_openclaw.py                  # 跑一次就退出
+    python stock_perp_24hvlum_openclaw.py --log run.log    # 同时写日志(UTF-8)
+
+本脚本【只跑一次】，不自带循环——周期调度交给系统定时任务。
+失败时打完整 traceback 并以退出码 1 结束，调度器据此能识别失败（原先只打印错误
+就正常退出，会让调度器把失败当成功）。
+
+用 `--log` 而不是 shell 的 `>>`：日志由脚本以 UTF-8 直接写（stdout+stderr 都进，
+等价 2>&1），与控制台编码无关。Windows 上也不必设 PYTHONIOENCODING——
+console_io.init_output() 已在脚本内处理编码（否则输出里的 emoji 在 GBK 下会崩）。
+
+环境变量：
+    SLACK_WEBHOOK_URL   不设则只打屏不推送
+    PROXY_URL           交易所代理，默认 http://127.0.0.1:7890；能直连则设为空字符串
+    Windows 首次设置（cmd 执行一次，之后要重开新窗口才生效）：
+        setx SLACK_WEBHOOK_URL "https://hooks.slack.com/services/你的/webhook"
+        setx PROXY_URL "http://127.0.0.1:7890"
+        能直连交易所就设空： setx PROXY_URL ""
+
+定时（每 8 小时一次）：
+    Windows「任务计划程序」直接指向 python.exe，不经过任何脚本：
+        程序:   C:\path\to\python.exe
+        参数:   stock_perp_24hvlum_openclaw.py --log run.log
+        起始于: D:\stock_perp_analyse
+        触发器: 每天，重复间隔 8 小时，持续 1 天
+        建议勾选「如果任务运行失败，则重新启动」
+    或命令行创建：
+        schtasks /create /tn "StockPerpAnalyse" /sc hourly /mo 8 /st 00:10 ^
+          /tr "C:\path\to\python.exe D:\stock_perp_analyse\stock_perp_24hvlum_openclaw.py --log D:\stock_perp_analyse\run.log"
+    macOS/Linux crontab：
+        10 */8 * * * cd /path/to/repo && python3 stock_perp_24hvlum_openclaw.py --log run.log
+"""
 import requests
 import pandas as pd
 import time
@@ -5,6 +48,8 @@ from datetime import datetime
 import os
 import json
 from concurrent.futures import ThreadPoolExecutor
+
+from console_io import init_output
 
 # ====================== 配置 ======================
 PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:7890")  # 环境变量可覆盖；无代理设为 ""
@@ -1422,24 +1467,27 @@ def send_slack_volume_report(rows_vol, current_time):
 
 
 
-RUN_INTERVAL_SEC = 8 * 3600  # 循环模式间隔：8 小时
-
 if __name__ == "__main__":
     import sys
-    loop = '--loop' in sys.argv  # 加 --loop 则每 8 小时自动跑一次，否则只跑一次
-    while True:
-        try:
-            main()
-        except KeyboardInterrupt:
-            print("\n🛑 用户中断")
-            break
-        except Exception as e:
-            print(f"\n❌ 错误：{e}")
-        if not loop:
-            break
-        print(f"\n😴 休眠 8 小时后再次采集…（Ctrl+C 退出）")
-        try:
-            time.sleep(RUN_INTERVAL_SEC)
-        except KeyboardInterrupt:
-            print("\n🛑 用户中断")
-            break
+    import traceback
+
+    def _log_arg():
+        """--log FILE → 路径；未指定返回 None"""
+        if '--log' not in sys.argv:
+            return None
+        i = sys.argv.index('--log') + 1
+        return sys.argv[i] if i < len(sys.argv) else None
+
+    init_output(_log_arg())
+    # 只跑一次就退出，周期调度交给系统定时任务（原来的 --loop 自循环已去掉）。
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 用户中断")
+        sys.exit(130)
+    except Exception:
+        # 打完整 traceback 并以非 0 退出。原来只 print(e) 然后正常退出，
+        # 定时任务靠退出码判断成败，会把失败当成功 —— 静默失效。
+        print("\n❌ 本轮失败：")
+        traceback.print_exc()
+        sys.exit(1)

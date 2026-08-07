@@ -39,7 +39,7 @@ premium 尖峰达 +199bp、现货 −11.6%。极端行情下本脚本的等间�
       python funding_probe.py --report --since 2026-08-07   # 只分析该时间之后
 
 用 `--log` 而不是 shell 的 `>>`：日志由脚本以 UTF-8 直接写，与控制台编码无关。
-Windows 上也不必设 PYTHONIOENCODING —— _init_output() 已在脚本内处理编码。
+Windows 上也不必设 PYTHONIOENCODING —— init_output() 已在脚本内处理编码。
 
 后台长跑：
     Windows:  start /min python funding_probe.py --insts SNDK,SOXL,BTC --log funding_probe.log
@@ -70,45 +70,7 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
-def _init_output(log_path=None):
-    """让输出在任何平台都不会因编码崩掉，并可选同时写日志文件。
-
-    Windows 中文系统把输出重定向到文件时用 GBK，本脚本的 emoji(⚠ ❌ 🌐 📈 🔔 🛑)
-    编不出来 → UnicodeEncodeError 直接崩在第一行 print，一行日志都写不出。
-    原先靠外部 .bat 设 PYTHONIOENCODING=utf-8 绕过，现在在脚本内解决，
-    不再需要任何包装脚本：
-      errors='replace' 保留平台编码（中文在 GBK 下正常），只把 emoji 降级成 '?'，
-      比强制改成 utf-8 更稳——后者会让 GBK 控制台里的中文变乱码。
-
-    log_path 非空时输出同时写入该文件（**显式 UTF-8**，与控制台编码无关），
-    这样也不必用 shell 的 >> 重定向，跨平台行为一致。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except (ValueError, OSError):
-                pass
-    if log_path:
-        sys.stdout = _Tee(sys.stdout, log_path)
-
-
-class _Tee:
-    """同时写控制台与日志文件。行缓冲 + 每行 flush，长跑时日志可实时 tail。"""
-
-    def __init__(self, console, path):
-        self.console = console
-        self.file = open(path, "a", encoding="utf-8", buffering=1)
-
-    def write(self, s):
-        self.console.write(s)
-        self.file.write(s)
-        return len(s)
-
-    def flush(self):
-        self.console.flush()
-        self.file.flush()
-
+from console_io import init_output
 
 CSV_PATH = "funding_probe.csv"
 DEFAULT_INSTS = ("SNDK", "SOXL", "BTC")
@@ -527,10 +489,10 @@ def _opt(name, default, cast=str):
 
 if __name__ == "__main__":
     if "--report" in sys.argv:
-        _init_output()                      # 分析是交互式的，不写日志文件
+        init_output()                      # 分析是交互式的，不写日志文件
         report(since=_opt("--since", None))
     else:
-        _init_output(_opt("--log", None))   # 采样长跑，--log 指定则同时落日志
+        init_output(_opt("--log", None))   # 采样长跑，--log 指定则同时落日志
         ins = [s.strip().upper()
                for s in _opt("--insts", ",".join(DEFAULT_INSTS)).split(",") if s.strip()]
         try:

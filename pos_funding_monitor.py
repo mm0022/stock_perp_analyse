@@ -1,4 +1,4 @@
-"""持仓币对当期 funding 监控（每小时一次）
+r"""持仓币对当期 funding 监控（每小时一次）
 
 判定：Biyi LONGSHORT 永续腿(SM-PU)有持仓的币，当期单期 funding < 阈值(默认 -5bp) 即告警。
 方向假设：LONGSHORT = 现货多 + 永续空，故 funding 为负时我们付钱。Biyi 的 side 字段全为 None，
@@ -7,13 +7,42 @@
 失败可见性：Biyi 拉不到、某所 funding 全缺、持仓 base 匹配不上 perp symbol —— 都主动推 Slack
 运维告警，绝不静默当成「无告警」。
 
-用法：
-    python3 pos_funding_monitor.py            # 跑一次
-    python3 pos_funding_monitor.py --dry-run  # 跑一次但不发 Slack，只打屏
+用法（Windows / macOS / Linux 完全相同，不需要任何包装脚本）：
+    python pos_funding_monitor.py                       # 跑一次
+    python pos_funding_monitor.py --dry-run             # 跑一次但不发 Slack，只打屏
+    python pos_funding_monitor.py --log pos_funding_monitor.log   # 同时写日志(UTF-8)
+
+用 `--log` 而不是 shell 的 `>>`：日志由脚本以 UTF-8 直接写（stdout+stderr 都进，
+等价 2>&1），与控制台编码无关。Windows 上也不必设 PYTHONIOENCODING——
+console_io.init_output() 已在脚本内处理编码（否则输出里的 emoji 在 GBK 下会崩）。
+
 环境变量：
     SLACK_WEBHOOK_URL / ALERT_SLACK_WEBHOOK_URL(优先)  告警去哪
     ALERT_FUNDING_BP    阈值，默认 -5
     PROXY_URL           交易所代理，默认 http://127.0.0.1:7890（Biyi 是内网，始终不走代理）
+
+    Windows 首次设置（cmd 执行一次，之后要重开新窗口才生效）：
+        setx SLACK_WEBHOOK_URL "https://hooks.slack.com/services/你的/webhook"
+        setx PROXY_URL "http://127.0.0.1:7890"
+        ^ 这是【回退候选】：脚本每轮先试直连，直连不通才用它。能直连就设空： setx PROXY_URL ""
+
+定时每小时一次（这是**周期任务**，不是长跑进程）：
+    Windows「任务计划程序」直接指向 python.exe，不经过任何脚本：
+        程序:   C:\path\to\python.exe
+        参数:   pos_funding_monitor.py --log pos_funding_monitor.log
+        起始于: D:\stock_perp_analyse
+        触发器: 每天，重复间隔 1 小时，持续 1 天
+    或命令行创建（落在 05 分而非整点，避开交易所结算瞬间——费率此刻正在翻页）：
+        schtasks /create /tn "PosFundingMonitor" /sc hourly /st 00:05 ^
+          /tr "C:\path\to\python.exe D:\stock_perp_analyse\pos_funding_monitor.py --log D:\stock_perp_analyse\pos_funding_monitor.log"
+        查看： schtasks /query /tn "PosFundingMonitor" /v /fo list
+        试跑： schtasks /run  /tn "PosFundingMonitor"
+        删除： schtasks /delete /tn "PosFundingMonitor" /f
+    macOS/Linux crontab：
+        5 * * * * cd /path/to/repo && python3 pos_funding_monitor.py --log pos_funding_monitor.log
+
+前提检查：Biyi 是内网服务，运行这台机器必须能访问 https://biyi.tky.laozi.pro
+否则监控拿不到持仓（脚本会推 Slack 运维告警，不会静默当成「无告警」）。
 """
 import os
 import sys
@@ -23,6 +52,7 @@ from datetime import datetime
 import requests
 
 import stock_perp_24hvlum_openclaw as sp
+from console_io import init_output
 
 ALERT_FUNDING_BP = float(os.environ.get("ALERT_FUNDING_BP", "-5"))
 PROBE_URL = "https://fapi.binance.com/fapi/v1/ping"
@@ -692,5 +722,14 @@ def main(dry_run=False):
     send_slack(blocks)
 
 
+def _log_arg():
+    """--log FILE → 路径；未指定返回 None"""
+    if "--log" not in sys.argv:
+        return None
+    i = sys.argv.index("--log") + 1
+    return sys.argv[i] if i < len(sys.argv) else None
+
+
 if __name__ == "__main__":
+    init_output(_log_arg())
     main(dry_run='--dry-run' in sys.argv)
