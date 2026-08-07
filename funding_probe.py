@@ -1,4 +1,4 @@
-"""OKX funding 机制实测记录器
+r"""OKX funding 机制实测记录器
 
 结论（2026-08-06，12000+ 条跨夜采样，SNDK/SOXL/BTC 共 4 个完整周期）：
 **当期 fundingRate 是本期 premium 的运行累积均值**，代入死区公式即得
@@ -27,15 +27,32 @@ premium 尖峰达 +199bp、现货 −11.6%。极端行情下本脚本的等间�
 
 无法从接口回溯「历史上某时刻显示的费率」，所以只能自己记。
 
-用法：
-    python3 funding_probe.py                       # 前台跑，Ctrl+C 停
-    python3 funding_probe.py --interval 15         # 轮次周期(秒)，默认 15
-    python3 funding_probe.py --insts SNDK,BTC      # 标的，默认 SNDK,SOXL,BTC
-    python3 funding_probe.py --workers 3           # 并发标的数，默认 3（OKX 限频严格）
-    python3 funding_probe.py --no-mark             # 不取 mark/index，每标的 3 个请求降为 1
+用法（Windows / macOS / Linux 完全相同，不需要任何包装脚本）：
+    python funding_probe.py                        # 前台跑，Ctrl+C 停
+    python funding_probe.py --interval 15          # 轮次周期(秒)，默认 15
+    python funding_probe.py --insts SNDK,BTC       # 标的，默认 SNDK,SOXL,BTC
+    python funding_probe.py --workers 3            # 并发标的数，默认 3（OKX 限频严格）
+    python funding_probe.py --no-mark              # 不取 mark/index，每标的 3 个请求降为 1
+    python funding_probe.py --log funding_probe.log    # 同时写日志(UTF-8)
 落盘：funding_probe.csv（追加，断点续跑不覆盖）
-分析：python3 funding_probe.py --report           # 读 CSV 出结论，不联网
-      python3 funding_probe.py --report --since 2026-08-07   # 只分析该时间之后
+分析：python funding_probe.py --report            # 读 CSV 出结论，不联网
+      python funding_probe.py --report --since 2026-08-07   # 只分析该时间之后
+
+用 `--log` 而不是 shell 的 `>>`：日志由脚本以 UTF-8 直接写，与控制台编码无关。
+Windows 上也不必设 PYTHONIOENCODING —— _init_output() 已在脚本内处理编码。
+
+后台长跑：
+    Windows:  start /min python funding_probe.py --insts SNDK,SOXL,BTC --log funding_probe.log
+              开机自启用「任务计划程序」直接指向 python.exe：
+                程序: C:\path\to\python.exe
+                参数: funding_probe.py --insts SNDK,SOXL,BTC --log funding_probe.log
+                起始于: D:\stock_perp_analyse
+                触发器选「登录时」（长跑进程，不是 hourly 定时任务）
+              ⚠️ 必须关休眠，否则待机会中断采样、CSV 出大段空洞（管理员 cmd）：
+                powercfg /change standby-timeout-ac 0
+                powercfg /change hibernate-timeout-ac 0
+              笔记本还要把「关闭盖子的功能」设为「不采取任何操作」
+    macOS:    caffeinate -i python3 funding_probe.py --insts SNDK,SOXL,BTC --log funding_probe.log &
 
 多标的注意：
   - `--interval` 是**轮次周期**，睡眠按本轮耗时扣减，所以加标的不会让节奏漂移
@@ -52,6 +69,46 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 import requests
+
+def _init_output(log_path=None):
+    """让输出在任何平台都不会因编码崩掉，并可选同时写日志文件。
+
+    Windows 中文系统把输出重定向到文件时用 GBK，本脚本的 emoji(⚠ ❌ 🌐 📈 🔔 🛑)
+    编不出来 → UnicodeEncodeError 直接崩在第一行 print，一行日志都写不出。
+    原先靠外部 .bat 设 PYTHONIOENCODING=utf-8 绕过，现在在脚本内解决，
+    不再需要任何包装脚本：
+      errors='replace' 保留平台编码（中文在 GBK 下正常），只把 emoji 降级成 '?'，
+      比强制改成 utf-8 更稳——后者会让 GBK 控制台里的中文变乱码。
+
+    log_path 非空时输出同时写入该文件（**显式 UTF-8**，与控制台编码无关），
+    这样也不必用 shell 的 >> 重定向，跨平台行为一致。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+    if log_path:
+        sys.stdout = _Tee(sys.stdout, log_path)
+
+
+class _Tee:
+    """同时写控制台与日志文件。行缓冲 + 每行 flush，长跑时日志可实时 tail。"""
+
+    def __init__(self, console, path):
+        self.console = console
+        self.file = open(path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, s):
+        self.console.write(s)
+        self.file.write(s)
+        return len(s)
+
+    def flush(self):
+        self.console.flush()
+        self.file.flush()
+
 
 CSV_PATH = "funding_probe.csv"
 DEFAULT_INSTS = ("SNDK", "SOXL", "BTC")
@@ -470,8 +527,10 @@ def _opt(name, default, cast=str):
 
 if __name__ == "__main__":
     if "--report" in sys.argv:
+        _init_output()                      # 分析是交互式的，不写日志文件
         report(since=_opt("--since", None))
     else:
+        _init_output(_opt("--log", None))   # 采样长跑，--log 指定则同时落日志
         ins = [s.strip().upper()
                for s in _opt("--insts", ",".join(DEFAULT_INSTS)).split(",") if s.strip()]
         try:
@@ -480,4 +539,4 @@ if __name__ == "__main__":
                 workers=_opt("--workers", MAX_WORKERS, int),
                 want_mark="--no-mark" not in sys.argv)
         except KeyboardInterrupt:
-            print("\n🛑 停止。分析：python3 funding_probe.py --report")
+            print("\n🛑 停止。分析：python funding_probe.py --report")
