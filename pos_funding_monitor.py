@@ -212,7 +212,7 @@ def get_positions():
     """从 Biyi 拉持仓。返回 (positions, error)；error 非 None 表示这次数据不可信"""
     try:
         # 内网服务，显式禁用代理
-        r = requests.post(sp.BIYI_URL, json={"query": "$productType like SM-PU|SS-PU"},
+        r = requests.post(sp.BIYI_URL, json={"query":"not is_empty($productType) and $productType like SM-PU|SS-PU"},
                           timeout=15, proxies={'http': None, 'https': None})
     except Exception as e:
         return {ex: {} for ex in EXCHANGES}, f"Biyi 请求异常: {type(e).__name__}: {e}"

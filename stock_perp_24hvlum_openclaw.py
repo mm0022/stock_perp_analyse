@@ -158,7 +158,7 @@ def get_biyi_positions():
     out = {'Binance': {}, 'OKX': {}}
     try:
         # 内网服务，显式禁用代理
-        r = requests.post(BIYI_URL, json={"query": "$productType like SM-PU|SS-PU"},
+        r = requests.post(BIYI_URL, json={"query":"not is_empty($productType) and $productType like SM-PU|SS-PU"},
                           timeout=15, proxies={'http': None, 'https': None})
         if r.status_code != 200:
             print(f"⚠️ Biyi 持仓获取失败: {r.status_code}")
